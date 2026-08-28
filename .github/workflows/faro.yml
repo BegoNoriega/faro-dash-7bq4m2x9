@@ -1,0 +1,79 @@
+# Guarda este archivo en el repositorio como:  .github/workflows/faro.yml
+#
+# Qué hace: cada día corre faro_descargas.py en un servidor de GitHub (con
+# internet completo hacia Apple y Google), actualiza el histórico, y PUBLICA el
+# dashboard en GitHub Pages (tu URL personal). No necesita tu Mac, ni Drive, ni
+# Claude. Todo vive en tu cuenta de GitHub.
+
+name: Faro descargas
+
+on:
+  schedule:
+    - cron: "0 13 * * *"        # 13:00 UTC todos los días (~7:00 a.m. en CDMX)
+  workflow_dispatch: {}          # botón para correrlo a mano cuando quieras
+
+permissions:
+  contents: write                # para guardar el histórico actualizado en el repo
+  pages: write                   # para publicar en GitHub Pages
+  id-token: write                # requerido por la publicación de Pages
+
+concurrency:
+  group: faro
+  cancel-in-progress: false
+
+jobs:
+  correr:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Bajar el repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install requests PyJWT cryptography google-cloud-storage gspread google-auth pandas
+
+      - name: Escribir secretos a archivos temporales
+        run: |
+          printf '%s' '${{ secrets.CONFIG_JSON }}' > config.json
+          printf '%s' '${{ secrets.APPLE_P8 }}'    > apple_key.p8
+          printf '%s' '${{ secrets.GOOGLE_SA_JSON }}' > sa.json
+
+      - name: Correr el script
+        env:
+          FARO_APPLE_P8: apple_key.p8
+          FARO_SA_JSON: sa.json
+          # (sin FARO_DRIVE_FOLDER: en plan B no se sube a Drive)
+        run: python faro_descargas.py
+
+      - name: Borrar los secretos temporales
+        if: always()
+        run: rm -f config.json apple_key.p8 sa.json
+
+      - name: Guardar el histórico actualizado en el repo
+        run: |
+          git config user.name "faro-bot"
+          git config user.email "faro-bot@users.noreply.github.com"
+          git add faro_historico.csv
+          git commit -m "Actualiza histórico $(date -u +%F)" || echo "sin cambios que guardar"
+          git push
+
+      - name: Preparar el sitio (el dashboard como index.html)
+        run: |
+          mkdir -p _site
+          cp faro_dashboard.html _site/index.html
+
+      - name: Subir el sitio a Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Publicar en GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
