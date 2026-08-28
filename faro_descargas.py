@@ -22,7 +22,7 @@ Por qué el histórico local:
     aunque la ventana de Apple avance.
 
 Instalar dependencias (una sola vez):
-    pip install requests PyJWT cryptography google-cloud-storage gspread google-auth pandas
+    pip install requests PyJWT cryptography google-cloud-storage gspread google-auth pandas google-api-python-client
 
 Uso:
     python faro_descargas.py                 # incremental: refresca ~35 días y fusiona
@@ -32,6 +32,21 @@ Uso:
 
 Antes de correrlo: config.json debe existir (ya lo tienes).
 Los secretos (.p8 de Apple y JSON del service account) se referencian por RUTA.
+
+------------------------------------------------------------------------------
+NUEVO (para correr también en GitHub Actions / la nube, sin tu Mac):
+    El script ahora acepta rutas de secretos y el destino en Drive por
+    VARIABLES DE ENTORNO. Si no están definidas, usa lo de config.json (o sea,
+    en tu Mac funciona EXACTAMENTE igual que antes). Variables:
+
+      FARO_APPLE_P8    -> ruta al archivo .p8 de Apple (reemplaza apple.p8_path)
+      FARO_SA_JSON     -> ruta al JSON del service account (reemplaza play.service_account_path)
+      FARO_DRIVE_FOLDER-> ID de la carpeta de Drive donde subir el dashboard.
+                          Si está definida, al terminar sube faro_dashboard_body.html
+                          a esa carpeta (creándolo o actualizándolo). Requiere que
+                          esa carpeta esté COMPARTIDA con el correo de la cuenta de
+                          servicio (el client_email del JSON) como Editor.
+------------------------------------------------------------------------------
 """
 
 import argparse
@@ -39,6 +54,7 @@ import datetime as dt
 import gzip
 import io
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -72,6 +88,21 @@ def cargar_config():
     return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
+def ruta_p8(cfg):
+    """Ruta del .p8 de Apple: variable de entorno si existe, si no config.json."""
+    return os.environ.get("FARO_APPLE_P8") or cfg["apple"]["p8_path"]
+
+
+def ruta_sa(cfg):
+    """Ruta del JSON del service account: variable de entorno si existe, si no config.json."""
+    return os.environ.get("FARO_SA_JSON") or cfg["play"]["service_account_path"]
+
+
+def id_carpeta_drive(cfg):
+    """ID de carpeta de Drive para subir el dashboard (env o config o None)."""
+    return os.environ.get("FARO_DRIVE_FOLDER") or cfg.get("drive", {}).get("folder_id")
+
+
 # --------------------------------------------------------------------------
 # APPLE — App Store Connect: reporte SALES / SUMMARY (Sales and Trends)
 # --------------------------------------------------------------------------
@@ -80,7 +111,7 @@ APPLE_API = "https://api.appstoreconnect.apple.com/v1/salesReports"
 
 def apple_token(cfg):
     """Genera un JWT ES256 válido ~15 min para el App Store Connect API."""
-    private_key = Path(cfg["apple"]["p8_path"]).read_text()
+    private_key = Path(ruta_p8(cfg)).read_text()
     now = int(time.time())
     payload = {
         "iss": cfg["apple"]["issuer_id"],
@@ -173,9 +204,10 @@ def google_credenciales(cfg):
     scopes = [
         "https://www.googleapis.com/auth/devstorage.read_only",
         "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.file",
     ]
     return Credentials.from_service_account_file(
-        cfg["play"]["service_account_path"], scopes=scopes
+        ruta_sa(cfg), scopes=scopes
     )
 
 
@@ -409,6 +441,32 @@ def escribir_sheets(cfg, creds, df, por_mes, por_pais, kpis):
         + [[r["fecha"], r["tienda"], r["país"], int(r["descargas"])]
            for r in df.to_dict("records")]
     )
+
+
+# --------------------------------------------------------------------------
+# SUBIR EL DASHBOARD A GOOGLE DRIVE (para que la nube lo republique)
+# --------------------------------------------------------------------------
+def subir_a_drive(creds, ruta_local, folder_id):
+    """Sube (o actualiza) un archivo en una carpeta de Drive usando el service
+    account. Si ya existe uno con el mismo nombre en esa carpeta, lo reemplaza
+    (así el enlace/ID se mantiene estable). Requiere que la carpeta esté
+    compartida con el client_email del service account como Editor."""
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+
+    service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    nombre = Path(ruta_local).name
+    q = f"name = '{nombre}' and '{folder_id}' in parents and trashed = false"
+    res = service.files().list(q=q, spaces="drive", fields="files(id)").execute()
+    media = MediaFileUpload(ruta_local, mimetype="text/html", resumable=False)
+    existentes = res.get("files", [])
+    if existentes:
+        fid = existentes[0]["id"]
+        service.files().update(fileId=fid, media_body=media).execute()
+        return fid
+    meta = {"name": nombre, "parents": [folder_id]}
+    creado = service.files().create(body=meta, media_body=media, fields="id").execute()
+    return creado["id"]
 
 
 # --------------------------------------------------------------------------
@@ -738,6 +796,15 @@ def main():
     DASHBOARD_PATH.write_text(envolver_pagina(cuerpo), encoding="utf-8")
     DASHBOARD_BODY_PATH.write_text(cuerpo, encoding="utf-8")
     print(f"Dashboard generado: {DASHBOARD_PATH.name} (+ {DASHBOARD_BODY_PATH.name})")
+
+    # Subir el dashboard a Google Drive (para que la nube lo republique en tu URL)
+    folder_id = id_carpeta_drive(cfg)
+    if folder_id:
+        try:
+            fid = subir_a_drive(creds, str(DASHBOARD_BODY_PATH), folder_id)
+            print(f"Dashboard subido a Google Drive (carpeta {folder_id}, archivo {fid})")
+        except Exception as e:
+            print(f"  No se pudo subir el dashboard a Drive: {e}", file=sys.stderr)
 
     # Terminal
     imprimir_tabla_pais(por_pais, kpis)
